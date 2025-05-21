@@ -42,7 +42,7 @@ NxLite uses a pre-fork model with a master process that manages multiple worker 
       ├─────────┬─────────┬─────────┐
       │         │         │         │
 ┌─────▼───┐ ┌───▼─────┐ ┌─▼───────┐ ┌▼────────┐
-│ Worker 1 │ │ Worker 2 │ │ Worker 3│ │ Worker n│
+│ Worker1 │ │ Worker2 │ │ Worker3 │ │ Worker n│
 └─────┬───┘ └───┬─────┘ └─┬───────┘ └┬────────┘
       │         │         │          │
       ▼         ▼         ▼          ▼
