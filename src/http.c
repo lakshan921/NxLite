@@ -44,31 +44,76 @@ typedef struct {
     char *response;
     size_t response_len;
     time_t timestamp;
+    char vary_key[256];  
 } cache_entry_t;
 
 static cache_entry_t response_cache[CACHE_SIZE];
 static int cache_index = 0;
 
-static cache_entry_t *find_cached_response(const char *path) {
+static void generate_vary_key(const char *path, const http_request_t *request, char *key, size_t key_size) {
+    if (!request) {
+        strncpy(key, path, key_size - 1);
+        key[key_size - 1] = '\0';
+        return;
+    }
+    
+    snprintf(key, key_size, "%s:", path);
+    
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i][0], "User-Agent") == 0) {
+            size_t current_len = strlen(key);
+            snprintf(key + current_len, key_size - current_len, "UA:%s:", request->headers[i][1]);
+            break;
+        }
+    }
+    
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i][0], "Accept-Encoding") == 0) {
+            size_t current_len = strlen(key);
+            snprintf(key + current_len, key_size - current_len, "AE:%s", request->headers[i][1]);
+            break;
+        }
+    }
+}
+
+static cache_entry_t *find_cached_response(const char *path, const http_request_t *request) {
+    char vary_key[256];
+    generate_vary_key(path, request, vary_key, sizeof(vary_key));
+    
     for (int i = 0; i < CACHE_SIZE; i++) {
         if (response_cache[i].path[0] != '\0' && 
             strcmp(response_cache[i].path, path) == 0 &&
+            strcmp(response_cache[i].vary_key, vary_key) == 0 &&
             time(NULL) - response_cache[i].timestamp < CACHE_TIMEOUT) {
+            LOG_DEBUG("Cache hit for %s with vary key %s", path, vary_key);
             return &response_cache[i];
         }
     }
+    LOG_DEBUG("Cache miss for %s with vary key %s", path, vary_key);
     return NULL;
 }
 
-static void cache_response(const char *path, const char *response, size_t response_len) {
+static void cache_response(const char *path, const char *response, size_t response_len, const http_request_t *request) {
     cache_entry_t *entry = &response_cache[cache_index];
     
+    if (entry->response) {
+        free(entry->response);
+        entry->response = NULL;
+    }
+    
     strncpy(entry->path, path, PATH_MAX - 1);
+    entry->path[PATH_MAX - 1] = '\0';
+    
+    generate_vary_key(path, request, entry->vary_key, sizeof(entry->vary_key));
+    
     entry->response = malloc(response_len);
     if (entry->response) {
         memcpy(entry->response, response, response_len);
         entry->response_len = response_len;
         entry->timestamp = time(NULL);
+        LOG_DEBUG("Cached response for %s with vary key %s", path, entry->vary_key);
+    } else {
+        LOG_ERROR("Failed to allocate memory for cached response");
     }
     
     cache_index = (cache_index + 1) % CACHE_SIZE;
@@ -177,7 +222,7 @@ const char *http_get_mime_type(const char *path) {
     return mime_types[0].type;
 }
 
-int http_serve_file(const char *path, http_response_t *response) {
+int http_serve_file(const char *path, http_response_t *response, const http_request_t *request) {
     char full_path[PATH_MAX];
     
     strncpy(full_path, path, PATH_MAX - 1);
@@ -190,7 +235,7 @@ int http_serve_file(const char *path, http_response_t *response) {
     
     LOG_DEBUG("Serving file: %s", full_path);
     
-    cache_entry_t *cache = find_cached_response(full_path);
+    cache_entry_t *cache = find_cached_response(full_path, request);
     if (cache) {
         LOG_DEBUG("Using cached response for %s", full_path);
         response->is_cached = 1;
@@ -222,7 +267,8 @@ int http_serve_file(const char *path, http_response_t *response) {
     response->file_fd = file_fd;
     response->is_file = 1;
     
-    http_add_header(response, "Content-Type", http_get_mime_type(full_path));
+    const char *mime_type = http_get_mime_type(full_path);
+    http_add_header(response, "Content-Type", mime_type);
     
     char content_length[32];
     snprintf(content_length, sizeof(content_length), "%ld", (long)st.st_size);
@@ -233,15 +279,38 @@ int http_serve_file(const char *path, http_response_t *response) {
     strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm_info);
     http_add_header(response, "Last-Modified", last_modified);
     
+    char etag[64];
+    snprintf(etag, sizeof(etag), "\"%lx-%lx-%lx\"", 
+             (unsigned long)st.st_ino, 
+             (unsigned long)st.st_size, 
+             (unsigned long)st.st_mtime);
+    http_add_header(response, "ETag", etag);
+    
+    http_add_header(response, "Vary", "Accept-Encoding, User-Agent");
+    
     const char *ext = strrchr(full_path, '.');
-    if (ext && (strcasecmp(ext, ".css") == 0 || 
-                strcasecmp(ext, ".js") == 0 || 
-                strcasecmp(ext, ".png") == 0 || 
-                strcasecmp(ext, ".jpg") == 0 || 
-                strcasecmp(ext, ".jpeg") == 0 || 
-                strcasecmp(ext, ".gif") == 0 || 
-                strcasecmp(ext, ".ico") == 0)) {
-        http_add_header(response, "Cache-Control", "public, max-age=3600");
+    if (ext) {
+        if (strcasecmp(ext, ".css") == 0 || strcasecmp(ext, ".js") == 0) {
+            http_add_header(response, "Cache-Control", "public, max-age=86400, must-revalidate");
+        } 
+        else if (strcasecmp(ext, ".png") == 0 || 
+                 strcasecmp(ext, ".jpg") == 0 || 
+                 strcasecmp(ext, ".jpeg") == 0 || 
+                 strcasecmp(ext, ".gif") == 0 || 
+                 strcasecmp(ext, ".ico") == 0) {
+            http_add_header(response, "Cache-Control", "public, max-age=604800, immutable");
+        }
+        else if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) {
+            http_add_header(response, "Cache-Control", "public, max-age=300, must-revalidate");
+        }
+        else if (strcasecmp(ext, ".pdf") == 0 || 
+                 strcasecmp(ext, ".doc") == 0 || 
+                 strcasecmp(ext, ".docx") == 0) {
+            http_add_header(response, "Cache-Control", "public, max-age=86400");
+        }
+        else {
+            http_add_header(response, "Cache-Control", "public, max-age=3600");
+        }
         
         if (st.st_size < 1024 * 1024) {
             char *file_content = malloc(st.st_size);
@@ -270,7 +339,7 @@ int http_serve_file(const char *path, http_response_t *response) {
                     if (complete_response) {
                         memcpy(complete_response, header, header_len);
                         memcpy(complete_response + header_len, file_content, st.st_size);
-                        cache_response(full_path, complete_response, header_len + st.st_size);
+                        cache_response(full_path, complete_response, header_len + st.st_size, request);
                         free(complete_response);
                     }
                 }
@@ -280,10 +349,6 @@ int http_serve_file(const char *path, http_response_t *response) {
     } else {
         http_add_header(response, "Cache-Control", "no-cache, no-store, must-revalidate");
     }
-    
-    char etag[64];
-    snprintf(etag, sizeof(etag), "\"%lx-%lx\"", (unsigned long)st.st_ino, (unsigned long)st.st_mtime);
-    http_add_header(response, "ETag", etag);
     
     return 0;
 }
@@ -504,8 +569,216 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
         response->keep_alive = 0;  
         return;
     }
+    
+    cache_entry_t *cache = find_cached_response(file_path, request);
+    if (cache) {
+        LOG_DEBUG("Using cached response for %s", file_path);
+        response->is_cached = 1;
+        response->cached_response = cache->response;
+        response->body_length = cache->response_len;
+        response->keep_alive = http_should_keep_alive(request);
+        
+        if (is_head) {
+            response->body_length = 0;
+        }
+        
+        return;
+    }
 
-    if (http_serve_file(file_path, response) != 0) {
+    struct stat st;
+    if (stat(file_path, &st) == -1) {
+        LOG_WARN("File not found: %s", file_path);
+        response->status_code = 404;
+        response->status_text = "Not Found";
+        response->keep_alive = 0;
+        return;
+    }
+
+    const char* if_none_match = NULL;
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i][0], "If-None-Match") == 0) {
+            if_none_match = request->headers[i][1];
+            break;
+        }
+    }
+
+    const char* if_modified_since = NULL;
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i][0], "If-Modified-Since") == 0) {
+            if_modified_since = request->headers[i][1];
+            break;
+        }
+    }
+
+    char etag[64];
+    snprintf(etag, sizeof(etag), "\"%lx-%lx-%lx\"", 
+             (unsigned long)st.st_ino, 
+             (unsigned long)st.st_size, 
+             (unsigned long)st.st_mtime);
+
+    if (if_none_match) {
+        LOG_DEBUG("Checking ETag: client sent '%s', server has '%s'", if_none_match, etag);
+        
+        char if_none_match_copy[1024];
+        strncpy(if_none_match_copy, if_none_match, sizeof(if_none_match_copy) - 1);
+        if_none_match_copy[sizeof(if_none_match_copy) - 1] = '\0';
+        
+        char *token = strtok(if_none_match_copy, ",");
+        int matched = 0;
+        
+        while (token && !matched) {
+            while (isspace(*token)) token++;
+            
+            if (strcmp(token, "*") == 0) {
+                matched = 1;
+                break;
+            }
+            
+            char clean_token[256] = {0};
+            const char *start = token;
+            if (*start == 'W' && *(start+1) == '/') {
+                start += 2;
+            }
+            
+            if (*start == '"') {
+                start++;
+                const char *end = strrchr(start, '"');
+                if (end) {
+                    size_t len = end - start;
+                    strncpy(clean_token, start, len);
+                    clean_token[len] = '\0';
+                } else {
+                    strncpy(clean_token, start, sizeof(clean_token) - 1);
+                }
+            } else {
+                strncpy(clean_token, start, sizeof(clean_token) - 1);
+            }
+            
+            char *p = clean_token + strlen(clean_token) - 1;
+            while (p >= clean_token && isspace(*p)) {
+                *p = '\0';
+                p--;
+            }
+            
+            char our_etag[64] = {0};
+            const char *etag_start = etag;
+            if (*etag_start == '"') {
+                etag_start++;
+                const char *etag_end = strrchr(etag_start, '"');
+                if (etag_end) {
+                    size_t len = etag_end - etag_start;
+                    strncpy(our_etag, etag_start, len);
+                    our_etag[len] = '\0';
+                }
+            } else {
+                strncpy(our_etag, etag_start, sizeof(our_etag) - 1);
+            }
+            
+            LOG_DEBUG("Comparing cleaned ETags: client '%s' vs server '%s'", clean_token, our_etag);
+            
+            if (strcmp(clean_token, our_etag) == 0) {
+                matched = 1;
+                break;
+            }
+            
+            token = strtok(NULL, ",");
+        }
+        
+        if (matched) {
+            LOG_DEBUG("ETag match found, returning 304 Not Modified");
+            response->status_code = 304;
+            response->status_text = "Not Modified";
+            
+            http_add_header(response, "ETag", etag);
+            
+            const char *ext = strrchr(file_path, '.');
+            if (ext) {
+                if (strcasecmp(ext, ".css") == 0 || strcasecmp(ext, ".js") == 0) {
+                    http_add_header(response, "Cache-Control", "public, max-age=86400, must-revalidate");
+                } 
+                else if (strcasecmp(ext, ".png") == 0 || 
+                         strcasecmp(ext, ".jpg") == 0 || 
+                         strcasecmp(ext, ".jpeg") == 0 || 
+                         strcasecmp(ext, ".gif") == 0 || 
+                         strcasecmp(ext, ".ico") == 0) {
+                    http_add_header(response, "Cache-Control", "public, max-age=604800, immutable");
+                }
+                else if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) {
+                    http_add_header(response, "Cache-Control", "public, max-age=300, must-revalidate");
+                }
+                else {
+                    http_add_header(response, "Cache-Control", "public, max-age=3600");
+                }
+            }
+            
+            http_add_header(response, "Vary", "Accept-Encoding, User-Agent");
+            
+            response->keep_alive = http_should_keep_alive(request);
+            return;
+        }
+    }
+
+    if (if_modified_since) {
+        LOG_DEBUG("Checking If-Modified-Since: %s", if_modified_since);
+        
+        struct tm tm_since;
+        memset(&tm_since, 0, sizeof(struct tm));
+        int parsed = 0;
+        
+        if (!parsed && strptime(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT", &tm_since) != NULL) {
+            parsed = 1;
+        }
+        
+        if (!parsed && strptime(if_modified_since, "%A, %d-%b-%y %H:%M:%S GMT", &tm_since) != NULL) {
+            parsed = 1;
+        }
+        
+        if (!parsed && strptime(if_modified_since, "%a %b %d %H:%M:%S %Y", &tm_since) != NULL) {
+            parsed = 1;
+        }
+        
+        if (parsed) {
+            tm_since.tm_isdst = -1;
+            time_t since_time = mktime(&tm_since);
+            
+            if (since_time != -1) {
+                since_time += timezone;
+                
+                struct tm *tm_file = gmtime(&st.st_mtime);
+                char file_time_str[64];
+                strftime(file_time_str, sizeof(file_time_str), "%a, %d %b %Y %H:%M:%S GMT", tm_file);
+                
+                LOG_DEBUG("Comparing times: file time %s (%ld) vs if-modified-since %s (%ld)", 
+                          file_time_str, (long)st.st_mtime, if_modified_since, (long)since_time);
+                
+                if (difftime(st.st_mtime, since_time) <= 0) {
+                    LOG_DEBUG("File not modified since %s, returning 304", if_modified_since);
+                    response->status_code = 304;
+                    response->status_text = "Not Modified";
+                    
+                    http_add_header(response, "ETag", etag);
+                    
+                    char last_modified[64];
+                    strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm_file);
+                    http_add_header(response, "Last-Modified", last_modified);
+                    http_add_header(response, "Vary", "Accept-Encoding, User-Agent");
+                    
+                    response->keep_alive = http_should_keep_alive(request);
+                    return;
+                } else {
+                    LOG_DEBUG("File was modified since %s, returning full response", if_modified_since);
+                }
+            } else {
+                LOG_WARN("Failed to convert parsed time to time_t");
+            }
+        } else {
+            LOG_WARN("Failed to parse If-Modified-Since date: %s", if_modified_since);
+        }
+    }
+
+    if (http_serve_file(file_path, response, request) != 0) {
+        response->status_code = 404;
+        response->status_text = "Not Found";
         response->keep_alive = 0;  
         return;
     }

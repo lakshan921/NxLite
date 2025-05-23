@@ -53,7 +53,7 @@ int http_parse_request(const char *buffer, size_t length, http_request_t *reques
 void http_create_response(http_response_t *response, int status_code);
 void http_add_header(http_response_t *response, const char *name, const char *value);
 int http_send_response(int client_fd, http_response_t *response);
-int http_serve_file(const char *path, http_response_t *response);
+int http_serve_file(const char *path, http_response_t *response, const http_request_t *request);
 const char *http_get_mime_type(const char *path);
 void http_free_response(http_response_t *response);
 int http_should_keep_alive(const http_request_t *request);
