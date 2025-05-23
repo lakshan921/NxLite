@@ -92,7 +92,7 @@ make
 ./nxlite
 
 # Run with custom configuration
-./nxlite -c /path/to/config/server.conf
+./nxlite /path/to/config/server.conf
 ```
 
 ## Configuration
@@ -115,7 +115,7 @@ keep_alive_timeout=120
 
 ```bash
 # View access log in real-time
-tail -f ./build/access.log
+tail -f build/logs/access.log 
 ```
 
 ## Benchmarking
