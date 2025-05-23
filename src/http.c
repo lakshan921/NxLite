@@ -198,6 +198,11 @@ void http_create_response(http_response_t *response, int status_code) {
         }
     }
     
+    response->compression_type = COMPRESSION_NONE;
+    response->compressed_body = NULL;
+    response->compressed_length = 0;
+    response->compression_level = COMPRESSION_LEVEL_NONE;
+    
     http_add_header(response, "Server", "NxLite");
 }
 
@@ -263,16 +268,84 @@ int http_serve_file(const char *path, http_response_t *response, const http_requ
         return -1;
     }
     
-    response->body_length = st.st_size;
-    response->file_fd = file_fd;
-    response->is_file = 1;
-    
     const char *mime_type = http_get_mime_type(full_path);
     http_add_header(response, "Content-Type", mime_type);
     
-    char content_length[32];
-    snprintf(content_length, sizeof(content_length), "%ld", (long)st.st_size);
-    http_add_header(response, "Content-Length", content_length);
+    int is_compressible = http_should_compress_mime_type(mime_type);
+    
+    if (is_compressible && response->compression_type != COMPRESSION_NONE && st.st_size <= 10 * 1024 * 1024) {
+        void *file_content = malloc(st.st_size);
+        if (file_content) {
+            ssize_t bytes_read = pread(file_fd, file_content, st.st_size, 0);
+            if (bytes_read == st.st_size) {
+                response->body = file_content;
+                response->body_length = st.st_size;
+                response->is_file = 0;
+                close(file_fd);
+                
+                int compression_level = COMPRESSION_LEVEL_DEFAULT;
+                
+                if (strncasecmp(mime_type, "text/html", 9) == 0 || 
+                    strncasecmp(mime_type, "text/css", 8) == 0 ||
+                    strncasecmp(mime_type, "application/javascript", 22) == 0) {
+                    compression_level = COMPRESSION_LEVEL_DEFAULT;
+                }
+                else if (strncasecmp(mime_type, "image/", 6) == 0 ||
+                        strncasecmp(mime_type, "application/octet-stream", 24) == 0) {
+                    compression_level = COMPRESSION_LEVEL_MIN;
+                }
+                else if (strncasecmp(mime_type, "application/font", 16) == 0 ||
+                        strncasecmp(mime_type, "image/svg+xml", 13) == 0) {
+                    compression_level = COMPRESSION_LEVEL_MAX;
+                }
+                
+                if (http_compress_content(response, response->compression_type, compression_level) == 0) {
+                    if (response->compression_type == COMPRESSION_GZIP) {
+                        http_add_header(response, "Content-Encoding", "gzip");
+                        LOG_DEBUG("Applied gzip compression: %zu bytes -> %zu bytes", 
+                                  response->body_length, response->compressed_length);
+                    } else if (response->compression_type == COMPRESSION_DEFLATE) {
+                        http_add_header(response, "Content-Encoding", "deflate");
+                        LOG_DEBUG("Applied deflate compression: %zu bytes -> %zu bytes", 
+                                  response->body_length, response->compressed_length);
+                    }
+                    
+                    char content_length[32];
+                    snprintf(content_length, sizeof(content_length), "%zu", response->compressed_length);
+                    http_add_header(response, "Content-Length", content_length);
+                } else {
+                    char content_length[32];
+                    snprintf(content_length, sizeof(content_length), "%zu", response->body_length);
+                    http_add_header(response, "Content-Length", content_length);
+                }
+            } else {
+                free(file_content);
+                response->body_length = st.st_size;
+                response->file_fd = file_fd;
+                response->is_file = 1;
+                
+                char content_length[32];
+                snprintf(content_length, sizeof(content_length), "%ld", (long)st.st_size);
+                http_add_header(response, "Content-Length", content_length);
+            }
+        } else {
+            response->body_length = st.st_size;
+            response->file_fd = file_fd;
+            response->is_file = 1;
+            
+            char content_length[32];
+            snprintf(content_length, sizeof(content_length), "%ld", (long)st.st_size);
+            http_add_header(response, "Content-Length", content_length);
+        }
+    } else {
+        response->body_length = st.st_size;
+        response->file_fd = file_fd;
+        response->is_file = 1;
+        
+        char content_length[32];
+        snprintf(content_length, sizeof(content_length), "%ld", (long)st.st_size);
+        http_add_header(response, "Content-Length", content_length);
+    }
     
     char last_modified[64];
     struct tm *tm_info = gmtime(&st.st_mtime);
@@ -312,7 +385,7 @@ int http_serve_file(const char *path, http_response_t *response, const http_requ
             http_add_header(response, "Cache-Control", "public, max-age=3600");
         }
         
-        if (st.st_size < 1024 * 1024) {
+        if (st.st_size < 1024 * 1024 && response->compressed_body == NULL) {
             char *file_content = malloc(st.st_size);
             if (file_content) {
                 ssize_t bytes_read = pread(file_fd, file_content, st.st_size, 0);
@@ -481,6 +554,34 @@ int http_send_response(int client_fd, http_response_t *response) {
         return 1;  
     }
     
+    if (response->compressed_body && response->compressed_length > 0) {
+        ssize_t sent = send(client_fd, header_buffer, header_len, MSG_MORE | MSG_NOSIGNAL);
+        if (sent != header_len) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;  
+            } else if (errno == EPIPE || errno == ECONNRESET) {
+                LOG_DEBUG("Client disconnected during header send: %s", strerror(errno));
+                return -1;
+            }
+            LOG_ERROR("Failed to send headers: %s", strerror(errno));
+            return -1;
+        }
+        
+        sent = send(client_fd, response->compressed_body, response->compressed_length, MSG_NOSIGNAL);
+        if (sent != (ssize_t)response->compressed_length) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;  
+            } else if (errno == EPIPE || errno == ECONNRESET) {
+                LOG_DEBUG("Client disconnected during compressed body send: %s", strerror(errno));
+                return -1;
+            }
+            LOG_ERROR("Failed to send compressed body: %s", strerror(errno));
+            return -1;
+        }
+        
+        return 1;  
+    }
+    
     if (response->body && response->body_length > 0) {
         ssize_t sent = send(client_fd, header_buffer, header_len, MSG_MORE | MSG_NOSIGNAL);
         if (sent != header_len) {
@@ -527,6 +628,16 @@ int http_send_response(int client_fd, http_response_t *response) {
 void http_free_response(http_response_t *response) {
     if (response->is_file && response->file_fd != -1) {
         close(response->file_fd);
+    }
+    
+    if (response->body) {
+        free(response->body);
+        response->body = NULL;
+    }
+    
+    if (response->compressed_body) {
+        free(response->compressed_body);
+        response->compressed_body = NULL;
     }
 }
 
@@ -737,7 +848,7 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
             parsed = 1;
         }
         
-        if (parsed) {
+        if (parsed) {   
             tm_since.tm_isdst = -1;
             time_t since_time = mktime(&tm_since);
             
@@ -761,6 +872,7 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
                     char last_modified[64];
                     strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm_file);
                     http_add_header(response, "Last-Modified", last_modified);
+                    
                     http_add_header(response, "Vary", "Accept-Encoding, User-Agent");
                     
                     response->keep_alive = http_should_keep_alive(request);
@@ -776,6 +888,17 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
         }
     }
 
+    const char *content_type = http_get_mime_type(file_path);
+    
+    int is_compressible = http_should_compress_mime_type(content_type);
+    
+    compression_type_t compression_type = COMPRESSION_NONE;
+    if (is_compressible) {
+        compression_type = http_negotiate_compression(request);
+    }
+    
+    response->compression_type = compression_type;
+
     if (http_serve_file(file_path, response, request) != 0) {
         response->status_code = 404;
         response->status_text = "Not Found";
@@ -784,6 +907,49 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
     }
 
     response->keep_alive = http_should_keep_alive(request);
+    
+    if (compression_type != COMPRESSION_NONE && !response->is_file && response->body && 
+        response->body_length > 0 && response->compressed_body == NULL) {
+        int compression_level = COMPRESSION_LEVEL_DEFAULT;
+        
+        if (strncasecmp(content_type, "text/html", 9) == 0 || 
+            strncasecmp(content_type, "text/css", 8) == 0 ||
+            strncasecmp(content_type, "application/javascript", 22) == 0) {
+            compression_level = COMPRESSION_LEVEL_DEFAULT;
+        }
+        else if (strncasecmp(content_type, "image/", 6) == 0 ||
+                 strncasecmp(content_type, "application/octet-stream", 24) == 0) {
+            compression_level = COMPRESSION_LEVEL_MIN;
+        }   
+        else if (strncasecmp(content_type, "application/font", 16) == 0 ||
+                 strncasecmp(content_type, "image/svg+xml", 13) == 0) {
+            compression_level = COMPRESSION_LEVEL_MAX;
+        }
+        
+        if (http_compress_content(response, compression_type, compression_level) == 0) {
+            if (compression_type == COMPRESSION_GZIP) {
+                http_add_header(response, "Content-Encoding", "gzip");
+            } else if (compression_type == COMPRESSION_DEFLATE) {
+                http_add_header(response, "Content-Encoding", "deflate");
+            }
+            
+            char content_length[32];
+            snprintf(content_length, sizeof(content_length), "%zu", response->compressed_length);
+            
+            int found = 0;
+            for (int i = 0; i < response->header_count; i++) {
+                if (strcasecmp(response->headers[i][0], "Content-Length") == 0) {
+                    strncpy(response->headers[i][1], content_length, MAX_HEADER_SIZE - 1);
+                    found = 1;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                http_add_header(response, "Content-Length", content_length);
+            }
+        }
+    }
     
     if (response->keep_alive) {
         char timeout_str[32];
@@ -799,4 +965,148 @@ void http_handle_request(const http_request_t *request, http_response_t *respons
         response->is_cached = 0;
         response->body_length = 0;
     }
+}
+
+int http_should_compress_mime_type(const char *mime_type) {
+    if (!mime_type) {
+        return 0;
+    }
+    
+    static const char *compressible_types[] = {
+        "text/",
+        "application/javascript",
+        "application/json",
+        "application/xml",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/x-font-ttf",
+        "application/x-font-opentype",
+        "application/vnd.ms-fontobject",
+        "application/font-woff",
+        "application/font-woff2",
+        NULL
+    };
+    
+    for (int i = 0; compressible_types[i] != NULL; i++) {
+        if (strncasecmp(mime_type, compressible_types[i], strlen(compressible_types[i])) == 0) {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+compression_type_t http_negotiate_compression(const http_request_t *request) {
+    if (!request) {
+        return COMPRESSION_NONE;
+    }
+    
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i][0], "Accept-Encoding") == 0) {
+            const char *encodings = request->headers[i][1];
+            
+            if (strstr(encodings, "gzip") != NULL) {
+                LOG_DEBUG("Client accepts gzip compression");
+                return COMPRESSION_GZIP;
+            }
+            
+            if (strstr(encodings, "deflate") != NULL) {
+                LOG_DEBUG("Client accepts deflate compression");
+                return COMPRESSION_DEFLATE;
+            }
+        }
+    }
+    
+    return COMPRESSION_NONE;
+}
+
+int http_compress_content(http_response_t *response, compression_type_t type, int level) {
+    if (!response || !response->body || response->body_length == 0) {
+        return -1;
+    }
+    
+    if (response->compressed_body) {
+        return 0;
+    }
+    
+    if (type != COMPRESSION_GZIP && type != COMPRESSION_DEFLATE) {
+        return -1;
+    }
+    
+    if (level < COMPRESSION_LEVEL_MIN || level > COMPRESSION_LEVEL_MAX) {
+        level = COMPRESSION_LEVEL_DEFAULT;
+    }
+    
+    size_t buffer_size = response->body_length + 128;
+    unsigned char *compressed = malloc(buffer_size);
+    
+    if (!compressed) {
+        LOG_ERROR("Failed to allocate memory for compression");
+        return -1;
+    }
+    
+    z_stream strm;
+    memset(&strm, 0, sizeof(strm));
+    
+    int window_bits = (type == COMPRESSION_GZIP) ? (15 + 16) : 15;
+    
+    if (deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        LOG_ERROR("Failed to initialize zlib compression");
+        free(compressed);
+        return -1;
+    }
+    
+    strm.avail_in = response->body_length;
+    strm.next_in = (Bytef*)response->body;
+    strm.avail_out = buffer_size;
+    strm.next_out = compressed;
+    
+    int ret = deflate(&strm, Z_FINISH);
+    
+    if (ret != Z_STREAM_END) {
+        free(compressed);
+        deflateEnd(&strm);
+        
+        buffer_size = response->body_length * 2;
+        compressed = malloc(buffer_size);
+        
+        if (!compressed) {
+            LOG_ERROR("Failed to allocate memory for compression retry");
+            return -1;
+        }
+        
+        memset(&strm, 0, sizeof(strm));
+        
+        if (deflateInit2(&strm, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+            LOG_ERROR("Failed to initialize zlib compression for retry");
+            free(compressed);
+            return -1;
+        }
+        
+        strm.avail_in = response->body_length;
+        strm.next_in = (Bytef*)response->body;
+        strm.avail_out = buffer_size;
+        strm.next_out = compressed;
+        
+        ret = deflate(&strm, Z_FINISH);
+        
+        if (ret != Z_STREAM_END) {
+            LOG_ERROR("Failed to compress data even with larger buffer");
+            free(compressed);
+            deflateEnd(&strm);
+            return -1;
+        }
+    }
+    
+    response->compressed_body = compressed;
+    response->compressed_length = strm.total_out;
+    response->compression_type = type;
+    response->compression_level = level;
+    
+    LOG_DEBUG("Compressed %zu bytes to %zu bytes (%d%% reduction)",
+              response->body_length, response->compressed_length,
+              (int)(100 - (response->compressed_length * 100.0 / response->body_length)));
+    
+    deflateEnd(&strm);
+    return 0;
 } 

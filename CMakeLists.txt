@@ -14,6 +14,10 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_definitions(-DNDEBUG)
 endif()
 
+# Find zlib for compression
+find_package(ZLIB REQUIRED)
+include_directories(${ZLIB_INCLUDE_DIRS})
+
 # include directories
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
@@ -33,7 +37,7 @@ set(SOURCES
 # executable
 add_executable(NxLite ${SOURCES})
 
-target_link_libraries(NxLite pthread rt)  # rt for timerfd
+target_link_libraries(NxLite pthread rt ${ZLIB_LIBRARIES})  # rt for timerfd, zlib for compression
 
 # installation paths
 install(TARGETS NxLite DESTINATION bin)
